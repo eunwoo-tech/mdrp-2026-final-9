@@ -270,7 +270,6 @@ def calculate_angle(line):
 
     return float(angle_deg)
 
-
 class LineDetector(Node):
     def __init__(self) -> None:
         super().__init__("line_detector_node")
