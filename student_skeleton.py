@@ -125,6 +125,7 @@ def detect_monitor(image):
     tl, tr, br, bl = current_corners
     return tuple(tl), tuple(tr), tuple(br), tuple(bl)
     
+
 def rectify_monitor(image, top_left, top_right, bottom_right, bottom_left):
     if any(p is None for p in (top_left, top_right, bottom_right, bottom_left)):
         return None
@@ -132,7 +133,7 @@ def rectify_monitor(image, top_left, top_right, bottom_right, bottom_left):
     rect = np.array([top_left, top_right, bottom_right, bottom_left], dtype="float32")
     (tl, tr, br, bl) = rect
 
-    # 16:9 강제 비율 제거, 실제 거리 기반 너비/높이 동적 계산
+    # 1. 실제 거리 기반 너비/높이 동적 계산 (회전 판단용)
     widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
     widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
     maxWidth = max(int(widthA), int(widthB))
@@ -141,17 +142,34 @@ def rectify_monitor(image, top_left, top_right, bottom_right, bottom_left):
     heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
 
+    # 2. 16:9 표준 가로/세로 출력 크기 타깃 설정 (기본 해상도: 800 x 450)
+    # 이미지 디테일을 더 살리고 싶다면 1280, 720 등으로 높여도 좋습니다.
+    TARGET_WIDTH = 800
+    TARGET_HEIGHT = 450
+
+    # 3. 만약 세로가 가로보다 긴 상태(피벗 모니터)라면 타깃 비율을 일시적으로 세로형(450x800)으로 설정
+    is_portrait = maxHeight > maxWidth
+    if is_portrait:
+        dst_w, dst_h = TARGET_HEIGHT, TARGET_WIDTH
+    else:
+        dst_w, dst_h = TARGET_WIDTH, TARGET_HEIGHT
+
+    # 4. 투영 변환용 목적지(dst) 좌표계 매핑
     dst = np.array([
         [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype="float32")
+        [dst_w - 1, 0],
+        [dst_w - 1, dst_h - 1],
+        [0, dst_h - 1]], dtype="float32")
 
+    # 5. 원근 왜곡 보정 (Warp Perspective) 적용
     M = cv2.getPerspectiveTransform(rect, dst)
-    rectified = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    rectified = cv2.warpPerspective(image, M, (dst_w, dst_h))
+    
+    # 6. 세로형 모니터였던 경우, 이미지를 시계 방향으로 90도 회전시켜 최종 16:9(800x450) 규격으로 변환
+    if is_portrait:
+        rectified = cv2.rotate(rectified, cv2.ROTATE_90_CLOCKWISE)
     
     return rectified
-
 
 def detect_line(rectified):
     if rectified is None:
@@ -159,40 +177,69 @@ def detect_line(rectified):
 
     h, w = rectified.shape[:2]
     
-    # 1. 모니터 베젤(테두리) 그림자를 선으로 착각하지 않도록 상하좌우 5% 여백(ROI)을 잘라냅니다.
+    # 1. ROI 설정 (베젤 그림자 배제)
     margin_x = int(w * 0.05)
     margin_y = int(h * 0.05)
     roi = rectified[margin_y:h-margin_y, margin_x:w-margin_x]
     
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     
-    # 2. 대비를 높이고 Canny 엣지로 선의 윤곽을 땁니다.
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    # 대비 극대화
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-    edges = cv2.Canny(enhanced, 50, 150)
+    blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
     
-    # 3. 허프 변환 (HoughLinesP)으로 직선 추출
-    # 화면 대각선 길이의 10% 이상 되는 선분만 찾도록 설정하여 자잘한 노이즈 무시
-    min_len = int(np.hypot(w, h) * 0.1)
+    # 2. [일반화 핵심 1] 엣지 민감도 상향
+    # 빨간색(어두운 회색)과 검은색 사이의 미세한 차이도 엣지로 잡아내기 위해 상한선을 90으로 낮춤
+    edges = cv2.Canny(blurred, 30, 90, apertureSize=3)
+    
+    # 윤곽선 찾기 (서로 엉겨붙지 않도록 날것의 엣지 그대로 사용)
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    
+    # 깨끗한 도화지 준비
+    clean_edges = np.zeros_like(edges)
+    diag_len = np.hypot(w, h)
+    
+    for c in contours:
+        # 3. [일반화 핵심 2] 덩어리를 꽉 감싸는 '최소 면적 사각형' 추출
+        rect = cv2.minAreaRect(c)
+        (cx, cy), (rw, rh), angle = rect
+        
+        length = max(rw, rh)
+        thickness = min(rw, rh)
+        
+        # 두께가 0인 1픽셀짜리 완벽한 선을 위한 방어 코드
+        aspect_ratio = length / thickness if thickness > 0 else float('inf')
+            
+        # [궁극의 필터]
+        # 조건 A: 길이가 화면 대각선의 5% 이상일 것 (자잘한 점, 먼지 제거)
+        # 조건 B: 가로세로 비율이 1:4 이상일 것 (글씨, 별모양, 다각형, 캐릭터 윤곽선 전멸)
+        if length > diag_len * 0.05 and aspect_ratio > 3.0:
+            cv2.drawContours(clean_edges, [c], -1, 255, 1)
+
+    # 4. 잡동사니가 멸종된 깨끗해진 도화지 위에서 허프 변환 수행
+    min_line_len = int(diag_len * 0.15)
+    
     lines = cv2.HoughLinesP(
-        edges, 
+        clean_edges, 
         rho=1, 
         theta=np.pi/180, 
-        threshold=30, 
-        minLineLength=min_len, 
-        maxLineGap=20  # 살짝 끊어진 선도 하나의 선으로 이어줌
+        threshold=40, 
+        minLineLength=min_line_len, 
+        maxLineGap=20  # 이제 노이즈가 없으므로 20픽셀 정도 끊겨있어도 안심하고 이어붙임
     )
 
     if lines is None:
         return None
 
-    # 4. 찾은 선들 중에서 유클리드 거리(길이)가 가장 긴 선 하나만 선택
+    # 5. 가장 긴 선 찾기
     longest_line = None
     max_length = -1
 
     for ln in lines:
         x1, y1, x2, y2 = ln[0]
         length = np.hypot(x2 - x1, y2 - y1)
+        
         if length > max_length:
             max_length = length
             longest_line = (x1, y1, x2, y2)
@@ -200,11 +247,10 @@ def detect_line(rectified):
     if longest_line is None:
         return None
 
-    # 5. ROI 기준으로 찾은 좌표를 원본 평면화(Rectified) 이미지 좌표계로 원복
+    # 6. ROI 좌표 복원
     x1, y1, x2, y2 = longest_line
     return (x1 + margin_x, y1 + margin_y, x2 + margin_x, y2 + margin_y)
-
-
+        
 def calculate_angle(line):
     if line is None:
         return None
