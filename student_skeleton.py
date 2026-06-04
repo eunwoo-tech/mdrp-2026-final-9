@@ -14,15 +14,23 @@ from std_msgs.msg import Float32
 
 
 def detect_monitor(image):
+    # [핵심 트릭] 클래스를 건드리지 않고, 함수 스스로 이전 상태를 기억하도록 정적(Static) 변수처럼 활용
+    if not hasattr(detect_monitor, "prev_corners"):
+        detect_monitor.prev_corners = None
+        detect_monitor.bad_count = 0
+
     img_h, img_w = image.shape[:2]
     img_area = img_h * img_w
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    edges = cv2.Canny(blurred, 40, 150)
     
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    # 중앙 가중치를 위한 중심점 및 최대 거리 계산
+    img_center = (img_w / 2.0, img_h / 2.0)
+    max_dist = np.hypot(img_w, img_h) / 2.0
+
+    blurred = cv2.bilateralFilter(image, 9, 75, 75)
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+
+    edges = cv2.Canny(gray, 30, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -32,9 +40,9 @@ def detect_monitor(image):
 
     for c in contours:
         area = cv2.contourArea(c)
-        if img_area * 0.05 < area < img_area * 0.85:
+        if img_area * 0.05 < area < img_area * 0.90:
             rect = cv2.minAreaRect(c)
-            rw, rh = rect[1]
+            (cx, cy), (rw, rh), _ = rect
             rect_area = rw * rh
             
             if rect_area == 0:
@@ -43,13 +51,26 @@ def detect_monitor(image):
             extent = area / rect_area
             aspect_ratio = max(rw, rh) / min(rw, rh) if min(rw, rh) > 0 else 0
             
-            if extent > 0.65 and 1.2 < aspect_ratio < 3.0:
-                score = area * extent 
+            if extent > 0.50 and 1.2 < aspect_ratio < 3.5:
+                # [공간 방어] 화면 중앙에 가까울수록 가산점 (가장자리의 화려한 노이즈 배제)
+                dist_to_center = np.hypot(cx - img_center[0], cy - img_center[1])
+                center_weight = 1.0 - (dist_to_center / max_dist) * 0.3  # 0.7 ~ 1.0의 가중치
+                
+                score = area * extent * center_weight
                 if score > best_score:
                     best_score = score
                     best_contour = c
 
+    # 모니터 탐지에 실패했을 때의 처리
     if best_contour is None:
+        if detect_monitor.prev_corners is not None:
+            detect_monitor.bad_count += 1
+            if detect_monitor.bad_count < 5:
+                # 잠깐 안 보이는 거라면 이전 좌표로 버팀
+                tl, tr, br, bl = detect_monitor.prev_corners
+                return tuple(tl), tuple(tr), tuple(br), tuple(bl)
+        # 완전히 잃어버렸다면 초기화
+        detect_monitor.prev_corners = None
         return None, None, None, None
 
     # 4. 고무줄(Convex Hull) 씌우기
@@ -60,35 +81,49 @@ def detect_monitor(image):
     for eps in [0.01, 0.02, 0.03, 0.04, 0.05]:
         peri = cv2.arcLength(hull, True)
         approx = cv2.approxPolyDP(hull, eps * peri, True)
-        
         if len(approx) == 4:
-            # [핵심 방어] 모서리가 파먹혔는지 면적으로 검사!
-            # 4개의 점으로 만든 면적이 원래 고무줄(Hull) 면적보다 5% 이상 작아졌다면
-            # (즉, 모서리가 잘려 나가서 사다리꼴이 되었다면) 이 4개 점을 가차 없이 버림
-            approx_area = cv2.contourArea(approx)
-            if approx_area / hull_area > 0.95: 
+            if cv2.contourArea(approx) / hull_area > 0.90: 
                 screen_pts = approx.reshape(4, 2)
                 break
 
-    # 5. 모서리가 잘려 나갔거나 4점을 못 찾은 경우 (허공 꼭짓점 복원)
-    # minAreaRect를 사용해 끊어진 선들을 가상으로 연장시켜 '진짜 꼭짓점'을 수학적으로 계산합니다.
     if screen_pts is None:
         rect_info = cv2.minAreaRect(best_contour)
         screen_pts = cv2.boxPoints(rect_info)
 
-    # 6. 좌표 정렬 (절대 꼬이지 않는 합/차 정렬)
+    # 좌표 정렬
     rect = np.zeros((4, 2), dtype="float32")
     s = screen_pts.sum(axis=1)
     rect[0] = screen_pts[np.argmin(s)]
     rect[2] = screen_pts[np.argmax(s)]
-    
     diff = np.diff(screen_pts, axis=1)
     rect[1] = screen_pts[np.argmin(diff)]
     rect[3] = screen_pts[np.argmax(diff)]
 
-    tl, tr, br, bl = rect
-    return tuple(tl), tuple(tr), tuple(br), tuple(bl)
+    current_corners = rect
 
+    # --- [시간 방어] 클래스 외부에서 동작하는 삑사리 및 Jitter 제어 ---
+    if detect_monitor.prev_corners is None:
+        detect_monitor.prev_corners = current_corners
+        detect_monitor.bad_count = 0
+    else:
+        dist = np.max(np.linalg.norm(current_corners - detect_monitor.prev_corners, axis=1))
+        
+        if dist > 100.0:  # 100픽셀 이상 갑자기 튀면 노이즈(삑사리)로 간주
+            detect_monitor.bad_count += 1
+            if detect_monitor.bad_count < 5:
+                current_corners = detect_monitor.prev_corners  # 이전 프레임 좌표 강제 유지
+            else:
+                detect_monitor.prev_corners = current_corners  # 화면 전환으로 인정
+                detect_monitor.bad_count = 0
+        else:
+            # 부드러운 이동을 위한 지수 이동 평균 (EMA)
+            alpha = 0.6
+            current_corners = (1.0 - alpha) * detect_monitor.prev_corners + alpha * current_corners
+            detect_monitor.prev_corners = current_corners
+            detect_monitor.bad_count = 0
+
+    tl, tr, br, bl = current_corners
+    return tuple(tl), tuple(tr), tuple(br), tuple(bl)
     
 def rectify_monitor(image, top_left, top_right, bottom_right, bottom_left):
     if any(p is None for p in (top_left, top_right, bottom_right, bottom_left)):
@@ -176,22 +211,19 @@ def calculate_angle(line):
 
     x1, y1, x2, y2 = line
     
-    # 이미지 좌표계는 좌상단이 (0,0)이고 아래로 갈수록 y가 증가합니다.
-    # 일반적인 데카르트 좌표계(수학/물리) 원점 기준에 맞춰 계산하기 위해 y축 방향을 뒤집어 줍니다.
-    dy = y1 - y2  
+    # 선의 방향을 항상 '아래에서 위로' 강제
+    if y1 < y2:
+        x1, y1, x2, y2 = x2, y2, x1, y1
+        
     dx = x2 - x1
-    
-    angle_rad = np.arctan2(dy, dx)
+    dy = y1 - y2  
+
+    # 수직 0도, 왼쪽 +, 오른쪽 -
+    angle_rad = np.arctan2(-dx, dy)
     angle_deg = np.degrees(angle_rad)
 
-    # 로봇 제어를 위해 각도를 -90도 ~ 90도 사이로 정규화
-    if angle_deg > 90:
-        angle_deg -= 180
-    elif angle_deg < -90:
-        angle_deg += 180
-
     return float(angle_deg)
-    
+
 
 class LineDetector(Node):
     def __init__(self) -> None:
