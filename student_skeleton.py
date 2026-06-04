@@ -191,7 +191,7 @@ def calculate_angle(line):
         angle_deg += 180
 
     return float(angle_deg)
-
+    
 
 class LineDetector(Node):
     def __init__(self) -> None:
@@ -205,75 +205,80 @@ class LineDetector(Node):
 
         self.bridge = CvBridge()
 
-        self.image_sub = self.create_subscription(Image, topic_image, self.image_callback, 10)
-        self.angle_pub = self.create_publisher(Float32, topic_student, 10)
-        self.line_pub = self.create_publisher(Image, "/debug/line", 10)
-        self.corner_pub = self.create_publisher(Image, "/debug/corners", 10)
-        
-        # [새로 추가됨] 컴퓨터가 인식한 윤곽선을 그대로 띄워주는 토픽
-        self.edge_pub = self.create_publisher(Image, "/debug/edges", 10)
+        self.image_sub = self.create_subscription(
+            Image,
+            topic_image,
+            self.image_callback,
+            10,
+        )
 
-        self.get_logger().info("Line detector started.")
+        self.angle_pub = self.create_publisher(
+            Float32,
+            topic_student,
+            10,
+        )
+
+        self.line_pub = self.create_publisher(
+            Image,
+            "/debug/line",
+            10,
+        )
+
+        self.get_logger().info(
+            f"Line detector started. Subscribing to {topic_image!r}, "
+            f"publishing to {topic_student!r}."
+        )
 
     def image_callback(self, msg: Image) -> None:
         try:
             image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as exc:
+            self.get_logger().warning(f"Failed to convert image: {exc!r}")
             return
 
-        # --- [추가됨] 윤곽선(Edge) 이미지를 rqt_image_view로 바로 전송 ---
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        blurred = cv2.bilateralFilter(clahe.apply(gray), 9, 75, 75)
-        edges = cv2.Canny(blurred, 30, 150)
-        
-        edge_msg = self.bridge.cv2_to_imgmsg(edges, encoding="mono8")
-        edge_msg.header = msg.header
-        self.edge_pub.publish(edge_msg)
-        # ----------------------------------------------------------------
-
+        # 1. Detect monitor.
         top_left, top_right, bottom_right, bottom_left = detect_monitor(image)
-        self._debug_corners(msg, image, top_left, top_right, bottom_right, bottom_left)
-
         if any(p is None for p in (top_left, top_right, bottom_right, bottom_left)):
+            self.get_logger().warning("Monitor not detected.")
             return
 
+        # 2. Rectify monitor.
         rectified = rectify_monitor(image, top_left, top_right, bottom_right, bottom_left)
         if rectified is None:
+            self.get_logger().warning("Monitor not rectified.")
             return
 
+        # 3. Detect line.
         line = detect_line(rectified)
         if line is None:
+            self.get_logger().warning("Line not detected.")
             return
-            
         self._debug_line(msg, rectified, line)
 
+        # 4. Calculate and publish angle.
         angle = calculate_angle(line)
         if angle is None:
+            self.get_logger().warning("Angle not calculated.")
             return
 
         angle_msg = Float32()
         angle_msg.data = float(angle)
         self.angle_pub.publish(angle_msg)
 
-    def _debug_corners(self, msg, image, tl, tr, br, bl):
-        debug_img = image.copy()
-        if not any(p is None for p in (tl, tr, br, bl)):
-            cv2.circle(debug_img, (int(tl[0]), int(tl[1])), 15, (0, 0, 255), -1)   
-            cv2.circle(debug_img, (int(tr[0]), int(tr[1])), 15, (0, 255, 0), -1)   
-            cv2.circle(debug_img, (int(br[0]), int(br[1])), 15, (255, 0, 0), -1)   
-            cv2.circle(debug_img, (int(bl[0]), int(bl[1])), 15, (0, 255, 255), -1) 
-            pts = np.array([tl, tr, br, bl], dtype=np.int32)
-            cv2.polylines(debug_img, [pts], True, (255, 0, 255), 3)
-
-        corner_msg = self.bridge.cv2_to_imgmsg(debug_img, encoding="bgr8")
-        corner_msg.header = msg.header
-        self.corner_pub.publish(corner_msg)
+        self.get_logger().info(f"Line angle: {float(angle):.2f} deg")
 
     def _debug_line(self, msg, rectified, line) -> None:
         debug_line = rectified.copy()
+
         x1, y1, x2, y2 = line
-        cv2.line(debug_line, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 6)
+        cv2.line(
+            debug_line,
+            (int(x1), int(y1)),
+            (int(x2), int(y2)),
+            (0, 0, 255),
+            6,
+        )
+
         debug_line_msg = self.bridge.cv2_to_imgmsg(debug_line, encoding="bgr8")
         debug_line_msg.header = msg.header
         self.line_pub.publish(debug_line_msg)
